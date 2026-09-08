@@ -1,6 +1,6 @@
 {
   "name": "@alexanderfortin/pi-platform-github",
-  "version": "2.25.1",
+  "version": "2.28.0",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
@@ -23,5 +23,7 @@
     "ignore": "^7.0.6",
     "simple-git": "^3.36.0"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "@actions/github": "^9.1.1"
+  }
 }

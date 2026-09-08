@@ -11,10 +11,10 @@
  */
 
 import {
-  AuthStorage,
   createAgentSessionFromServices,
   createAgentSessionServices,
-  ModelRegistry,
+  CredentialSynchronizationError,
+  ModelRuntime,
   SessionManager,
   SettingsManager,
 } from '@earendil-works/pi-coding-agent';
@@ -37,6 +37,32 @@ import type {
 import type { PlatformProvider } from '../platform';
 
 /**
+ * Derive retry-event payload types from the SDK's `AgentSessionEvent` union so
+ * the handler signatures stay a single source of truth — if the SDK ever changes
+ * a payload field, the compiler catches the drift here rather than in two places.
+ */
+type AutoRetryStartEvent = Extract<AgentSessionEvent, { type: 'auto_retry_start' }>;
+type AutoRetryEndEvent = Extract<AgentSessionEvent, { type: 'auto_retry_end' }>;
+type SummarizationRetryScheduledEvent = Extract<
+  AgentSessionEvent,
+  { type: 'summarization_retry_scheduled' }
+>;
+type SummarizationRetryAttemptStartEvent = Extract<
+  AgentSessionEvent,
+  { type: 'summarization_retry_attempt_start' }
+>;
+
+/**
+ * Hard ceiling for the post-credential-synchronisation catalog refresh.
+ *
+ * The recovery refresh runs with `allowNetwork: true`, so a stalled or
+ * unreachable provider catalog endpoint could otherwise wedge the action
+ * until the overall job timeout. Bounding it fails fast and falls through to
+ * the actionable error message instead of hanging.
+ */
+const MODEL_REFRESH_TIMEOUT_MS = 15_000;
+
+/**
  * Pi coding agent for headless execution inside GitHub Actions.
  *
  * Wraps model resolution, authentication, agent session lifecycle, and prompt
@@ -44,8 +70,7 @@ import type { PlatformProvider } from '../platform';
  */
 export class Agent {
   private model!: Model<Api>;
-  private authStorage: AuthStorage = AuthStorage.create();
-  private modelRegistry: ModelRegistry;
+  private modelRuntime!: ModelRuntime;
   private session!: AgentSession;
   private thinkingLevel: ThinkingLevel;
   private outputChunks: string[] = [];
@@ -93,20 +118,6 @@ export class Agent {
     this.config = config;
     this.events = events ?? {};
     this.thinkingLevel = (config.thinkingLevel ?? 'off') as ThinkingLevel;
-    this.modelRegistry = ModelRegistry.create(this.authStorage);
-
-    if (config.token) {
-      this.logger.debug(`[auth] Setting api_key token for ${config.provider} provider`);
-      this.authStorage.set(config.provider, {
-        type: 'api_key',
-        key: config.token,
-      });
-    }
-
-    if (config.baseUrl) {
-      this.logger.debug(`[provider] Overriding base URL for ${config.provider}: ${config.baseUrl}`);
-      this.modelRegistry.registerProvider(config.provider, { baseUrl: config.baseUrl });
-    }
   }
 
   /**
@@ -138,11 +149,28 @@ export class Agent {
 
     const settingsManager = SettingsManager.create(cwd);
 
+    // Create and configure the model runtime (replaces the legacy
+    // AuthStorage + ModelRegistry pair). ModelRuntime.create() is async
+    // (it refreshes the model catalog), so initialisation happens here in
+    // ready() rather than in the constructor.
+    this.modelRuntime = await ModelRuntime.create();
+
+    if (this.config.token) {
+      this.logger.debug(`[auth] Setting api_key token for ${this.config.provider} provider`);
+      await this.applyRuntimeApiKey(this.config.token);
+    }
+
+    if (this.config.baseUrl) {
+      this.logger.debug(
+        `[provider] Overriding base URL for ${this.config.provider}: ${this.config.baseUrl}`
+      );
+      this.modelRuntime.registerProvider(this.config.provider, { baseUrl: this.config.baseUrl });
+    }
+
     // Phase 1: Create services (loads extensions, registers providers).
     const services = await createAgentSessionServices({
       cwd,
-      authStorage: this.authStorage,
-      modelRegistry: this.modelRegistry,
+      modelRuntime: this.modelRuntime,
       settingsManager,
       resourceLoaderOptions,
     });
@@ -166,7 +194,7 @@ export class Agent {
 
     // Resolve the model AFTER extensions have loaded — extensions that call
     // pi.registerProvider() will have populated the model registry by now.
-    const foundModel = this.modelRegistry.find(this.config.provider, this.config.model);
+    const foundModel = this.modelRuntime.getModel(this.config.provider, this.config.model);
     if (foundModel) {
       this.model = foundModel;
     } else {
@@ -261,6 +289,15 @@ export class Agent {
     }
 
     this.sessionEventHandler = (event: AgentSessionEvent) => {
+      // Route all retry-related events (auto_retry_*, summarization_retry_*) to
+      // a dedicated sub-handler. Checked up-front via a string guard rather
+      // than individual `case` labels to keep this dispatcher's cyclomatic
+      // complexity low — the SDK may add further `*_retry_*` variants and they
+      // all belong to the same retry sub-tree.
+      if (event.type.includes('retry')) {
+        this.handleRetryEvent(event);
+        return;
+      }
       switch (event.type) {
         case 'message_update':
           this.handleMessageUpdate(event.assistantMessageEvent);
@@ -282,6 +319,65 @@ export class Agent {
     this.session.subscribe(this.sessionEventHandler);
 
     return this;
+  }
+
+  /**
+   * Apply the configured runtime API key, recovering from a credential-sync
+   * failure with a clear, actionable message.
+   *
+   * `ModelRuntime.setRuntimeApiKey()` commits the credential to the store and
+   * then synchronises the in-memory model/auth snapshot (local composition +
+   * availability recompute). If the credential commits but that local sync
+   * fails, the SDK throws {@link CredentialSynchronizationError} rather than
+   * leaving the runtime half-synchronised — which would otherwise surface as
+   * a confusing downstream "Model not found".
+   *
+   * The key was already saved, so we attempt one explicit, forced catalog
+   * refresh to recover (the documented remedy when remote freshness is
+   * needed), bounded by {@link MODEL_REFRESH_TIMEOUT_MS} so a stalled catalog
+   * endpoint fails fast rather than hanging the action. If that also fails —
+   * or times out — we rethrow a message that names the provider and points at
+   * the most likely-affected inputs.
+   *
+   * @param token - The API key to set. Caller guarantees it is non-empty.
+   * @private
+   */
+  private async applyRuntimeApiKey(token: string): Promise<void> {
+    try {
+      await this.modelRuntime.setRuntimeApiKey(this.config.provider, token);
+    } catch (error) {
+      if (!(error instanceof CredentialSynchronizationError)) {
+        throw error;
+      }
+      const providerId = error.providerId;
+      this.logger.warning(
+        `[auth] API key for "${providerId}" was saved, but the model state ` +
+          'could not be synchronized — attempting a catalog refresh to recover'
+      );
+      // Bound the recovery refresh so a stalled catalog endpoint fails fast
+      // instead of hanging the action until the job timeout. Guarded for
+      // environments where AbortSignal.timeout is unavailable.
+      const refreshSignal =
+        typeof AbortSignal.timeout === 'function'
+          ? AbortSignal.timeout(MODEL_REFRESH_TIMEOUT_MS)
+          : undefined;
+      const { aborted, errors } = await this.modelRuntime.refresh({
+        providers: [providerId],
+        allowNetwork: true,
+        force: true,
+        ...(refreshSignal ? { signal: refreshSignal } : undefined),
+      });
+      const refreshError = errors.get(providerId);
+      if (aborted || refreshError) {
+        throw new Error(
+          `Could not synchronize model state for provider "${providerId}" after setting its API key. ` +
+            'The key was saved, but the model catalog could not be refreshed ' +
+            `(${refreshError ? refreshError.message : 'refresh aborted'}). ` +
+            'Check that the `provider`, `model`, and `base_url` inputs are valid for this provider.',
+          { cause: error }
+        );
+      }
+    }
   }
 
   /**
@@ -358,6 +454,17 @@ export class Agent {
   }
 
   /**
+   * Release the underlying SDK session and its provider resources.
+   *
+   * In particular, the OpenAI Codex transport caches a reusable WebSocket
+   * for five minutes. `AgentSession.dispose()` closes that socket and clears
+   * its expiry timer so headless callers can exit immediately.
+   */
+  dispose(): void {
+    this.session?.dispose();
+  }
+
+  /**
    * Handle `message_update` session events.
    *
    * Routes text deltas to the output buffer and thinking deltas/completion
@@ -416,6 +523,129 @@ export class Agent {
   }
 
   /**
+   * Dispatch retry-related session events (`auto_retry_*`, `summarization_retry_*`)
+   * to their dedicated handlers.
+   *
+   * Extracted from the main {@link sessionEventHandler} switch so the primary
+   * dispatcher stays lean and the retry sub-tree is self-contained.
+   *
+   * @param event - A retry-related `AgentSessionEvent`.
+   * @private
+   */
+  private handleRetryEvent(event: AgentSessionEvent): void {
+    switch (event.type) {
+      case 'auto_retry_start':
+        this.handleAutoRetryStart(event);
+        break;
+      case 'auto_retry_end':
+        this.handleAutoRetryEnd(event);
+        break;
+      case 'summarization_retry_scheduled':
+        this.handleSummarizationRetryScheduled(event);
+        break;
+      case 'summarization_retry_attempt_start':
+        this.handleSummarizationRetryAttemptStart(event);
+        break;
+      case 'summarization_retry_finished':
+        this.handleSummarizationRetryFinished();
+        break;
+      default:
+        break;
+    }
+  }
+
+  /**
+   * Handle `auto_retry_start` session events.
+   *
+   * Pi auto-retries transient provider failures (network/DNS errors, 5xx,
+   * rate limits, early stream endings) per the configured retry policy. Each
+   * retry adds latency and token cost, so surface the start so operators can
+   * correlate slow/expensive runs. This event arrives on the raw session
+   * stream (not the `ExtensionAPI` `pi.on()` surface).
+   *
+   * @param event - The auto-retry-start payload.
+   * @private
+   */
+  private handleAutoRetryStart(event: AutoRetryStartEvent): void {
+    this.logger.info(
+      `[auto-retry] 🔄 provider call retrying — attempt ${event.attempt}/${event.maxAttempts} ` +
+        `after ${event.delayMs}ms (last error: ${event.errorMessage})`
+    );
+  }
+
+  /**
+   * Handle `auto_retry_end` session events.
+   *
+   * Fires when the auto-retry loop settles. Log recovery at info and
+   * exhaustion at warning — a failed retry loop usually precedes a
+   * session-level error that {@link handleAgentEnd} captures, but the
+   * warning makes the exhaustion visible in isolation too.
+   *
+   * @param event - The auto-retry-end payload.
+   * @private
+   */
+  private handleAutoRetryEnd(event: AutoRetryEndEvent): void {
+    if (event.success) {
+      this.logger.info(`[auto-retry] ✅ recovered on attempt ${event.attempt}`);
+    } else {
+      const detail = event.finalError ? `: ${event.finalError}` : '';
+      this.logger.warning(`[auto-retry] ❌ exhausted after attempt ${event.attempt}${detail}`);
+    }
+  }
+
+  /**
+   * Handle `summarization_retry_scheduled` session events.
+   *
+   * Fires when an auto-compaction's summary generation itself retries (the
+   * summarisation LLM call hit a transient failure). Mirrors `auto_retry_start`
+   * but for the compaction/branch-summary sub-flow, so operators have full
+   * retry visibility — without this, compaction-summary retries are invisible
+   * even though provider-call retries are logged.
+   *
+   * @param event - The summarization-retry-scheduled payload.
+   * @private
+   */
+  private handleSummarizationRetryScheduled(event: SummarizationRetryScheduledEvent): void {
+    this.logger.info(
+      `[summarization-retry] 🔄 summary generation retrying — attempt ` +
+        `${event.attempt}/${event.maxAttempts} after ${event.delayMs}ms ` +
+        `(last error: ${event.errorMessage})`
+    );
+  }
+
+  /**
+   * Handle `summarization_retry_attempt_start` session events.
+   *
+   * Fires at the start of each summarisation retry attempt. The `source`
+   * discriminates whether the summary being retried is a branch summary
+   * (tree navigation) or a compaction summary (context threshold/overflow).
+   * Logged at debug to avoid noise — the scheduled/finished pair already
+   * brackets the retry loop at info level.
+   *
+   * @param event - The summarization-retry-attempt-start payload.
+   * @private
+   */
+  private handleSummarizationRetryAttemptStart(event: SummarizationRetryAttemptStartEvent): void {
+    const reason = event.source === 'compaction' ? `compaction (${event.reason})` : 'branchSummary';
+    this.logger.debug(`[summarization-retry] ▶️ starting ${reason} summary attempt`);
+  }
+
+  /**
+   * Handle `summarization_retry_finished` session events.
+   *
+   * Fires when the summarisation retry loop settles. The SDK does not carry a
+   * success/error field on this event, so we log a neutral marker — not a
+   * green checkmark — to avoid implying recovery. Paired with
+   * {@link handleSummarizationRetryScheduled} this brackets the loop so
+   * operators can see it began and ended.
+   *
+   * @private
+   */
+  private handleSummarizationRetryFinished(): void {
+    this.logger.info(`[summarization-retry] • summary retry loop finished`);
+  }
+
+  /**
    * Collect session statistics including token usage from the underlying SDK.
    *
    * @returns Session stats or undefined if session not ready or stats unavailable.
@@ -466,6 +696,9 @@ export function wrapAgent(agent: Agent): PiAgent {
     },
     async exportSessionJsonl(outputPath: string) {
       return agent.exportSessionJsonl(outputPath);
+    },
+    dispose() {
+      agent.dispose();
     },
   };
 }

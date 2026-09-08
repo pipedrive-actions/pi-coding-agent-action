@@ -1,4 +1,4 @@
-import { describe, expect, test, mock } from 'bun:test';
+import { describe, expect, test, vi } from 'vitest';
 import { updatePullRequestToolFactory } from '@alexanderfortin/pi-orchestrator';
 import { mockExtensionContext as mockCtx, createMockProvider } from '../../helpers/tool-mocks';
 import * as githubIndex from '@alexanderfortin/pi-platform-github';
@@ -35,15 +35,20 @@ describe('update_pull_request tool - execution', () => {
     expect(typeof githubIndex.updatePullRequest).toBe('function');
   });
 
-  test('parameters schema - all fields are optional', () => {
+  test('parameters schema is strict-compatible (all fields required-but-nullable)', () => {
     const schema = updatePullRequestTool.parameters as any;
-    if (Array.isArray(schema.required)) {
-      expect(schema.required.length).toBe(0);
-    }
+    expect(schema.additionalProperties).toBe(false);
+    expect(updatePullRequestTool.constrainedSampling).toEqual({
+      type: 'json_schema',
+      strict: 'prefer',
+    });
+    expect(schema.required).toEqual(
+      expect.arrayContaining(['pull_number', 'title', 'body', 'message', 'dryRun'])
+    );
   });
 
   test('execute calls provider.updatePullRequest with empty params when nothing provided', async () => {
-    const updatePullRequest = mock((_params: any) =>
+    const updatePullRequest = vi.fn((_params: any) =>
       Promise.resolve({
         content: [{ type: 'text' as const, text: 'PR updated' }],
         details: {
@@ -66,7 +71,7 @@ describe('update_pull_request tool - execution', () => {
   });
 
   test('execute passes all optional params when provided', async () => {
-    const updatePullRequest = mock((_params: any) =>
+    const updatePullRequest = vi.fn((_params: any) =>
       Promise.resolve({
         content: [{ type: 'text' as const, text: 'PR updated' }],
         details: {
@@ -107,7 +112,7 @@ describe('update_pull_request tool - execution', () => {
   });
 
   test('execute omits undefined optional params', async () => {
-    const updatePullRequest = mock((_params: any) =>
+    const updatePullRequest = vi.fn((_params: any) =>
       Promise.resolve({
         content: [{ type: 'text' as const, text: 'ok' }],
         details: {
@@ -133,7 +138,7 @@ describe('update_pull_request tool - execution', () => {
   });
 
   test('execute returns cancellation result when signal is aborted', async () => {
-    const updatePullRequest = mock((_params: any) =>
+    const updatePullRequest = vi.fn((_params: any) =>
       Promise.resolve({
         content: [{ type: 'text' as const, text: 'should not be called' }],
         details: {

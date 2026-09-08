@@ -4,9 +4,11 @@
  * Tests the Pi agent wrapper including session stats handling.
  */
 
-import { describe, expect, test, mock } from 'bun:test';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { resolve } from 'node:path';
+import { CredentialSynchronizationError, ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { buildMockSession, injectMockSession, userHelloMessage } from './helpers/agent-session';
+import type { MockSession, MockSessionEvent } from './helpers/agent-session';
 import { createMockProvider } from '../helpers/tool-mocks';
 
 /**
@@ -17,7 +19,7 @@ function createCoreWithInfoCapture(): { core: any; messages: string[] } {
   const messages: string[] = [];
   const core = {
     ...mockCoreAdapter,
-    info: mock((msg: string) => {
+    info: vi.fn((msg: string) => {
       messages.push(msg);
     }),
   };
@@ -32,7 +34,7 @@ function createCoreWithErrorCapture(): { core: any; messages: string[] } {
   const messages: string[] = [];
   const core = {
     ...mockCoreAdapter,
-    error: mock((msg: string) => {
+    error: vi.fn((msg: string) => {
       messages.push(msg);
     }),
   };
@@ -47,7 +49,7 @@ function createCoreWithWarningCapture(): { core: any; messages: string[] } {
   const messages: string[] = [];
   const core = {
     ...mockCoreAdapter,
-    warning: mock((msg: string) => {
+    warning: vi.fn((msg: string) => {
       messages.push(msg);
     }),
   };
@@ -65,7 +67,7 @@ const defaultAgentConfig = {
 
 // Mock @actions/core to provide required inputs before importing Agent
 const noop = (): void => {};
-const mockGetInput = mock((name: string) => {
+const mockGetInput = vi.fn((name: string) => {
   if (name === 'github_token') {
     return 'fake-token';
   }
@@ -85,18 +87,18 @@ process.env.INPUT_MAX_COMMENTS = '100';
 
 // Dynamic import to ensure mocks are set up before module loads
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore TS1309 -- Top-level await not supported in CommonJS, but Bun test runner handles it
+// @ts-ignore TS1309 -- Top-level await not supported in CommonJS, but Vitest handles it
 const { Agent } = await import('@alexanderfortin/pi-orchestrator');
 
 // Create a mock CoreAdapter for tests
 const mockCoreAdapter = {
   getInput: mockGetInput,
-  notice: mock(noop),
-  debug: mock(noop),
-  info: mock(noop),
-  setFailed: mock(noop),
-  setOutput: mock(noop),
-  warning: mock(noop),
+  notice: vi.fn(noop),
+  debug: vi.fn(noop),
+  info: vi.fn(noop),
+  setFailed: vi.fn(noop),
+  setOutput: vi.fn(noop),
+  warning: vi.fn(noop),
 };
 
 // Create a mock PlatformProvider for tests
@@ -117,7 +119,7 @@ function createRealAgent(): InstanceType<typeof Agent> {
 
 describe('Agent', () => {
   describe('constructor', () => {
-    test('stores token in auth storage when provided', () => {
+    test('constructs without error when token is provided', () => {
       const agent = new Agent(mockCoreAdapter as any, mockPlatformProvider, {
         model: 'claude-sonnet-4-5',
         provider: 'anthropic',
@@ -129,22 +131,23 @@ describe('Agent', () => {
       expect(agent).toBeDefined();
     });
 
-    test('does not set auth storage when token is empty', () => {
+    test('does not set runtime API key when token is empty', async () => {
       const mockDebug: string[] = [];
       const debugLogger = (msg: string): void => {
         mockDebug.push(msg);
       };
-      const adapter = { ...mockCoreAdapter, debug: mock(debugLogger) };
+      const adapter = { ...mockCoreAdapter, debug: vi.fn(debugLogger) };
 
-      // Constructor no longer throws for unknown models — resolution is
-      // deferred to ready() so that extension-provided providers are available.
-      new Agent(adapter as any, mockPlatformProvider, {
+      // API-key setup moved from the constructor to ready() in the
+      // ModelRuntime migration, so verify at the ready() level.
+      const agent = new Agent(adapter as any, mockPlatformProvider, {
         model: 'claude-sonnet-4-5',
         provider: 'anthropic',
         token: '',
         thinkingLevel: 'off',
         promptInput: '',
       });
+      await agent.ready();
 
       // Should not log auth debug message
       expect(mockDebug).not.toContain('[auth] Setting api_key token');
@@ -196,12 +199,152 @@ describe('Agent', () => {
     });
   });
 
+  describe('CredentialSynchronizationError recovery', () => {
+    // setRuntimeApiKey() runs during ready() against the real ModelRuntime
+    // (its catalog is populated at create() time, so getModel() still
+    // resolves). Spies on the prototype methods let us drive the recovery
+    // branch without standing up a fake runtime. Restored after each test so
+    // the prototype mutations don't leak into the other (real-ready) tests.
+    const restore: (() => void)[] = [];
+    afterEach(() => {
+      while (restore.length) {
+        restore.pop()!();
+      }
+    });
+
+    /** Stub setRuntimeApiKey to reject with a CredentialSynchronizationError. */
+    function rejectWithSyncError(): void {
+      const spy = vi.spyOn(ModelRuntime.prototype, 'setRuntimeApiKey').mockRejectedValue(
+        new CredentialSynchronizationError('anthropic', 'setRuntimeApiKey', undefined, {
+          cause: new Error('local sync failed'),
+        })
+      );
+      restore.push(() => spy.mockRestore());
+    }
+
+    test('recovers and warns when the recovery catalog refresh succeeds', async () => {
+      rejectWithSyncError();
+      const refreshSpy = vi
+        .spyOn(ModelRuntime.prototype, 'refresh')
+        .mockResolvedValue({ aborted: false, errors: new Map() });
+      restore.push(() => refreshSpy.mockRestore());
+
+      const { core, messages } = createCoreWithWarningCapture();
+      const agent = new Agent(core as any, mockPlatformProvider, { ...defaultAgentConfig });
+
+      await expect(agent.ready()).resolves.toBe(agent);
+      // Recovery issues a forced, network-enabled refresh scoped to the provider,
+      // bounded by an AbortSignal timeout so a stalled endpoint can't hang.
+      expect(refreshSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          providers: ['anthropic'],
+          allowNetwork: true,
+          force: true,
+          signal: expect.any(AbortSignal),
+        })
+      );
+      expect(messages.some(m => m.includes('could not be synchronized'))).toBe(true);
+    });
+
+    test('omits the timeout signal when AbortSignal.timeout is unavailable', async () => {
+      rejectWithSyncError();
+      const refreshSpy = vi
+        .spyOn(ModelRuntime.prototype, 'refresh')
+        .mockResolvedValue({ aborted: false, errors: new Map() });
+      restore.push(() => refreshSpy.mockRestore());
+
+      // Simulate a runtime without AbortSignal.timeout (Node < 17.3) so the
+      // feature-detection guard takes the fallback and leaves the signal
+      // unset rather than throwing. Restored in afterEach.
+      const originalTimeout = AbortSignal.timeout;
+      Object.defineProperty(AbortSignal, 'timeout', { value: undefined, configurable: true });
+      restore.push(() =>
+        Object.defineProperty(AbortSignal, 'timeout', {
+          value: originalTimeout,
+          configurable: true,
+          writable: true,
+        })
+      );
+
+      const agent = new Agent(mockCoreAdapter as any, mockPlatformProvider, {
+        ...defaultAgentConfig,
+      });
+
+      // Recovery still succeeds — the refresh simply runs without a bound timeout.
+      await expect(agent.ready()).resolves.toBe(agent);
+      // Find the provider-scoped recovery call (create() also calls refresh with
+      // allowNetwork:false) and confirm it carries no `signal` property — the
+      // guard omitted it entirely because AbortSignal.timeout was unavailable.
+      const recoveryCall = refreshSpy.mock.calls.find(
+        c => c[0]?.providers?.includes('anthropic') && c[0]?.allowNetwork === true
+      );
+      expect(recoveryCall).toBeDefined();
+      expect(recoveryCall![0]).not.toHaveProperty('signal');
+    });
+
+    test('throws an actionable error naming the provider when recovery fails', async () => {
+      rejectWithSyncError();
+      const refreshSpy = vi.spyOn(ModelRuntime.prototype, 'refresh').mockResolvedValue({
+        aborted: false,
+        errors: new Map([['anthropic', new Error('upstream host unreachable')]]),
+      });
+      restore.push(() => refreshSpy.mockRestore());
+
+      const agent = new Agent(mockCoreAdapter as any, mockPlatformProvider, {
+        ...defaultAgentConfig,
+      });
+
+      await expect(agent.ready()).rejects.toThrow(
+        /Could not synchronize model state for provider "anthropic"[\s\S]*upstream host unreachable/
+      );
+    });
+
+    test('throws an actionable error when the recovery refresh is aborted', async () => {
+      rejectWithSyncError();
+      const refreshSpy = vi.spyOn(ModelRuntime.prototype, 'refresh').mockResolvedValue({
+        aborted: true,
+        errors: new Map(),
+      });
+      restore.push(() => refreshSpy.mockRestore());
+
+      const agent = new Agent(mockCoreAdapter as any, mockPlatformProvider, {
+        ...defaultAgentConfig,
+      });
+
+      await expect(agent.ready()).rejects.toThrow(
+        /Could not synchronize model state for provider "anthropic"[\s\S]*refresh aborted/
+      );
+    });
+
+    test('rethrows non-CredentialSynchronizationError failures unchanged', async () => {
+      const boom = new Error('unrelated failure');
+      const setKeySpy = vi
+        .spyOn(ModelRuntime.prototype, 'setRuntimeApiKey')
+        .mockRejectedValue(boom);
+      restore.push(() => setKeySpy.mockRestore());
+      const refreshSpy = vi.spyOn(ModelRuntime.prototype, 'refresh');
+      restore.push(() => refreshSpy.mockRestore());
+
+      const agent = new Agent(mockCoreAdapter as any, mockPlatformProvider, {
+        ...defaultAgentConfig,
+      });
+
+      await expect(agent.ready()).rejects.toBe(boom);
+      // create() legitimately calls refresh({ allowNetwork: false }) during
+      // ready(); the recovery branch never runs for a non-Credential error,
+      // so the forced provider-scoped refresh must never be invoked.
+      expect(refreshSpy).not.toHaveBeenCalledWith(
+        expect.objectContaining({ providers: ['anthropic'], allowNetwork: true, force: true })
+      );
+    });
+  });
+
   describe('run', () => {
     test('throws error for empty text', async () => {
       const agent = createRealAgent();
       await agent.ready();
 
-      expect(agent.run('')).rejects.toThrow('no text, skipping prompt');
+      await expect(agent.run('')).rejects.toThrow('no text, skipping prompt');
     });
 
     test('throws error for undefined text', async () => {
@@ -515,7 +658,7 @@ describe('Agent', () => {
     }
 
     test('onPromptComplete is called when agent_settled fires', async () => {
-      const onComplete = mock(() => {});
+      const onComplete = vi.fn(() => {});
       const agent = new Agent(mockCoreAdapter as any, mockPlatformProvider, {
         ...defaultAgentConfig,
       });
@@ -532,7 +675,7 @@ describe('Agent', () => {
     });
 
     test('onPromptComplete is NOT called for individual agent_end events', async () => {
-      const onComplete = mock(() => {});
+      const onComplete = vi.fn(() => {});
       const agent = createRealAgent();
       (agent as unknown as { events: { onPromptComplete: () => void } }).events = {
         onPromptComplete: onComplete,
@@ -638,6 +781,192 @@ describe('Agent', () => {
 
       const result = await agent.run('Hello');
       expect(result.error).toBe('429 rate limit');
+    });
+  });
+
+  /**
+   * Build a mock session that dispatches an arbitrary sequence of raw
+   * `AgentSessionEvent`s through the agent's registered handler when
+   * `prompt()` is called. Used to exercise events (e.g. `auto_retry_*`)
+   * that arrive on the session stream rather than the ExtensionAPI.
+   */
+  function buildRawEventSession(events: MockSessionEvent[]): MockSession {
+    let listener: ((event: MockSessionEvent) => void) | undefined;
+    return {
+      getSessionStats: () => ({ tokens: { input: 0, output: 0, total: 0 }, cost: 0 }),
+      prompt: async () => {
+        for (const event of events) {
+          listener?.(event);
+        }
+      },
+      subscribe: (cb: (event: MockSessionEvent) => void) => {
+        listener = cb;
+      },
+      state: { messages: [] },
+    };
+  }
+
+  describe('auto_retry event handling', () => {
+    test('auto_retry_start logs an info line with attempt/maxAttempts/delay/error', async () => {
+      const { core: testCore, messages: infoMessages } = createCoreWithInfoCapture();
+      const agent = new Agent(testCore as any, mockPlatformProvider, defaultAgentConfig);
+      await agent.ready();
+
+      injectMockSession(
+        agent,
+        buildRawEventSession([
+          {
+            type: 'auto_retry_start',
+            attempt: 1,
+            maxAttempts: 3,
+            delayMs: 1500,
+            errorMessage: '503 overloaded',
+          },
+          { type: 'auto_retry_end', success: true, attempt: 1 },
+          { type: 'agent_settled' },
+        ])
+      );
+
+      await agent.run('Hello');
+
+      const retryLine = infoMessages.find(m => m.startsWith('[auto-retry] 🔄'));
+      expect(retryLine).toBeDefined();
+      expect(retryLine).toContain('attempt 1/3');
+      expect(retryLine).toContain('1500ms');
+      expect(retryLine).toContain('503 overloaded');
+    });
+
+    test('auto_retry_end success logs an info recovery line', async () => {
+      const { core: testCore, messages: infoMessages } = createCoreWithInfoCapture();
+      const agent = new Agent(testCore as any, mockPlatformProvider, defaultAgentConfig);
+      await agent.ready();
+
+      injectMockSession(
+        agent,
+        buildRawEventSession([
+          {
+            type: 'auto_retry_start',
+            attempt: 2,
+            maxAttempts: 3,
+            delayMs: 0,
+            errorMessage: 'transient',
+          },
+          { type: 'auto_retry_end', success: true, attempt: 2 },
+          { type: 'agent_settled' },
+        ])
+      );
+
+      await agent.run('Hello');
+
+      const recoveredLine = infoMessages.find(m => m.startsWith('[auto-retry] ✅'));
+      expect(recoveredLine).toBeDefined();
+      expect(recoveredLine).toContain('attempt 2');
+    });
+
+    test('auto_retry_end failure logs a warning with the final error', async () => {
+      const { core: testCore, messages: warnings } = createCoreWithWarningCapture();
+      const agent = new Agent(testCore as any, mockPlatformProvider, defaultAgentConfig);
+      await agent.ready();
+
+      injectMockSession(
+        agent,
+        buildRawEventSession([
+          {
+            type: 'auto_retry_start',
+            attempt: 3,
+            maxAttempts: 3,
+            delayMs: 0,
+            errorMessage: 'still failing',
+          },
+          {
+            type: 'auto_retry_end',
+            success: false,
+            attempt: 3,
+            finalError: 'connection reset',
+          },
+          { type: 'agent_settled' },
+        ])
+      );
+
+      await agent.run('Hello');
+
+      const exhaustedLine = warnings.find(m => m.startsWith('[auto-retry] ❌'));
+      expect(exhaustedLine).toBeDefined();
+      expect(exhaustedLine).toContain('attempt 3');
+      expect(exhaustedLine).toContain('connection reset');
+    });
+  });
+
+  describe('summarization_retry event handling', () => {
+    test('summarization_retry_scheduled logs an info line with attempt/maxAttempts/delay/error', async () => {
+      const { core: testCore, messages: infoMessages } = createCoreWithInfoCapture();
+      const agent = new Agent(testCore as any, mockPlatformProvider, defaultAgentConfig);
+      await agent.ready();
+
+      injectMockSession(
+        agent,
+        buildRawEventSession([
+          {
+            type: 'summarization_retry_scheduled',
+            attempt: 1,
+            maxAttempts: 2,
+            delayMs: 800,
+            errorMessage: 'summary timeout',
+          },
+          { type: 'summarization_retry_finished' },
+          { type: 'agent_settled' },
+        ])
+      );
+
+      await agent.run('Hello');
+
+      const retryLine = infoMessages.find(m => m.startsWith('[summarization-retry] 🔄'));
+      expect(retryLine).toBeDefined();
+      expect(retryLine).toContain('attempt 1/2');
+      expect(retryLine).toContain('800ms');
+      expect(retryLine).toContain('summary timeout');
+    });
+
+    test('summarization_retry_attempt_start logs a debug line naming the source', async () => {
+      const debug = vi.fn();
+      const testCore = { ...mockCoreAdapter, debug };
+      const agent = new Agent(testCore as any, mockPlatformProvider, defaultAgentConfig);
+      await agent.ready();
+
+      injectMockSession(
+        agent,
+        buildRawEventSession([
+          { type: 'summarization_retry_attempt_start', source: 'compaction', reason: 'overflow' },
+          { type: 'agent_settled' },
+        ])
+      );
+
+      await agent.run('Hello');
+
+      const debugLine = debug.mock.calls.find(
+        (c: unknown[]) =>
+          typeof c[0] === 'string' && (c[0] as string).startsWith('[summarization-retry] ▶️')
+      );
+      expect(debugLine).toBeDefined();
+      expect(debugLine![0]).toContain('compaction');
+      expect(debugLine![0]).toContain('overflow');
+    });
+
+    test('summarization_retry_finished logs an info line', async () => {
+      const { core: testCore, messages: infoMessages } = createCoreWithInfoCapture();
+      const agent = new Agent(testCore as any, mockPlatformProvider, defaultAgentConfig);
+      await agent.ready();
+
+      injectMockSession(
+        agent,
+        buildRawEventSession([{ type: 'summarization_retry_finished' }, { type: 'agent_settled' }])
+      );
+
+      await agent.run('Hello');
+
+      const finishedLine = infoMessages.find(m => m.startsWith('[summarization-retry] •'));
+      expect(finishedLine).toBeDefined();
+      expect(finishedLine).toContain('finished');
     });
   });
 
@@ -782,7 +1111,7 @@ describe('Agent', () => {
       const agent = createRealAgent();
       await agent.ready();
 
-      const mockExportToHtml = mock(async (outputPath: string) => outputPath);
+      const mockExportToHtml = vi.fn(async (outputPath: string) => outputPath);
       agent['session'] = {
         ...agent['session'],
         exportToHtml: mockExportToHtml,
@@ -794,12 +1123,30 @@ describe('Agent', () => {
     });
   });
 
+  describe('dispose', () => {
+    test('disposes the underlying SDK session', () => {
+      const agent = new Agent(mockCoreAdapter as any, mockPlatformProvider, defaultAgentConfig);
+      const dispose = vi.fn();
+      (agent as unknown as { session: { dispose: () => void } }).session = { dispose };
+
+      agent.dispose();
+
+      expect(dispose).toHaveBeenCalledTimes(1);
+    });
+
+    test('is safe before the SDK session is initialized', () => {
+      const agent = new Agent(mockCoreAdapter as any, mockPlatformProvider, defaultAgentConfig);
+
+      expect(() => agent.dispose()).not.toThrow();
+    });
+  });
+
   describe('exportSessionJsonl', () => {
     test('delegates to session.exportToJsonl', async () => {
       const agent = createRealAgent();
       await agent.ready();
 
-      const mockExportToJsonl = mock((outputPath: string) => outputPath);
+      const mockExportToJsonl = vi.fn((outputPath: string) => outputPath);
       agent['session'] = {
         ...agent['session'],
         exportToJsonl: mockExportToJsonl,

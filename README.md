@@ -57,7 +57,7 @@ Create a workflow file, e.g., `.github/workflows/pi-agent.yml`. See the [interac
 The `develop` branch is in constant development while the `v2` branch is considered stable, if you don't want the bleeding edge you can pin to a specific release, e.g.
 
 ```yaml
-   uses: shaftoe/pi-coding-agent-action@v2.25.1
+   uses: shaftoe/pi-coding-agent-action@v2.28.0
 ```
 
 > [!NOTE]
@@ -75,9 +75,9 @@ If you need to pin to a specific Pi SDK version check out previous release tags 
 |---|---|---|
 | `@actions/core` | `3.0.1` | GitHub Actions core I/O (inputs, outputs, logging) |
 | `@actions/github` | `9.1.1` | GitHub API client (Octokit wrapper) |
-| `@earendil-works/pi-agent-core` | `0.80.7` | Pi Agent Core — agent orchestration primitives |
-| `@earendil-works/pi-ai` | `0.80.7` | Pi AI — AI model abstractions and providers |
-| `@earendil-works/pi-coding-agent` | `0.80.7` | Pi SDK — AI coding agent runtime |
+| `@earendil-works/pi-agent-core` | `0.85.1` | Pi Agent Core — agent orchestration primitives |
+| `@earendil-works/pi-ai` | `0.85.1` | Pi AI — AI model abstractions and providers |
+| `@earendil-works/pi-coding-agent` | `0.85.1` | Pi SDK — AI coding agent runtime |
 | `@js-temporal/polyfill` | `0.5.1` | Temporal API polyfill |
 | `@octokit/core` | `7.0.6` | Octokit REST API client core |
 | `@octokit/plugin-rest-endpoint-methods` | `17.0.0` | Octokit REST API endpoint methods |
@@ -258,6 +258,49 @@ You can also call a `workflow_dispatch` from another workflow step, e.g. to auto
 > [!TIP]
 > Combine `pr_number` with other inputs like `thinking_level`, `loaded_tools`, or `extensions` to customize the review behavior. For example, use `loaded_tools` to restrict the agent to read-only tools when you only want feedback without automatic fixes.
 
+### Comment Update Mode
+
+When running the action in automated workflows (e.g. PR reviews on `pull_request: [opened, synchronize]`), each push creates a new commit, which can result in many incremental comments from the bot cluttering the PR thread. By default, each run posts a new top-level comment.
+
+Set `update_comment: true` to instruct the action to **update/overwrite its previous comment** instead of creating a new one. The action identifies its prior comments by looking for a hidden HTML marker (`<!-- pi-coding-agent-comment -->`) embedded at the start of the comment body, so it will not touch comments authored by other users or bots.
+
+```yaml
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - uses: shaftoe/pi-coding-agent-action@v2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          provider: ${{ vars.PROVIDER }}
+          model: ${{ vars.MODEL }}
+          token: ${{ secrets.API_KEY }}
+          prompt: "Review this PR for bugs and security concerns."
+          update_comment: true
+```
+
+Behavior notes:
+
+- **Opt-in**: defaults to `false`, so existing workflows are unaffected.
+- **Fallback**: if `update_comment` is `true` but no previous bot comment is found (e.g. first run), a new comment is created as usual.
+- **Scope**: both top-level issue/PR comments and inline PR review-comment replies are updated. The two namespaces are fetched via different endpoints (`issues.listComments` vs. `pulls.listReviewComments`), so the lookup is namespace-aware.
+- **Marker**: the hidden HTML marker is invisible in rendered Markdown, so it does not change the visual appearance of the comment for end users.
+
+> [!NOTE]
+> If you prefer to **delete** older comments entirely rather than overwrite them, GitHub does not expose a direct "replace" API — the overwrite approach used here preserves comment history (GitHub keeps prior versions accessible via the comment edit history). For fully removing old comments, that would require a separate "prune stale bot comments" tool/step outside the scope of this feature.
+
 ### Recurring Tasks
 
 You can use the `schedule` trigger to run the action periodically for automated maintenance tasks like dependency audits, security scans, documentation updates, or code quality checks.
@@ -299,7 +342,7 @@ jobs:
           token: ${{ secrets.OPENAI_API_KEY }}
           prompt: |
             Audit the project's dependencies for security vulnerabilities, outdated packages,
-            and deprecated APIs. Check package.json, bun.lockb, and any lock files.
+            and deprecated APIs. Check package.json, pnpm-lock.yaml, and any lock files.
             If issues are found, create a pull request with updates and a summary of changes.
             If no issues are found, post a comment on the most recent issue or PR indicating
             the audit completed successfully with no findings.
@@ -496,6 +539,32 @@ See the [Custom Provider documentation](https://github.com/badlogic/pi-mono/blob
 > ```
 >
 > Refer to <https://pi.dev/docs/latest/custom-provider> for details.
+
+### AWS Bedrock
+
+The `amazon-bedrock` provider runs models hosted on [AWS Bedrock](https://aws.amazon.com/bedrock/) (Anthropic Claude, Amazon Nova, Meta Llama, Mistral, and many others) through the Converse Stream API. Model IDs use Bedrock's native format (e.g. `anthropic.claude-sonnet-4-5-20250929-v1:0`, `amazon.nova-pro-v1:0`); see the [Pi providers list](https://pi.dev/docs/latest) for the full catalogue.
+
+> [!IMPORTANT]
+> Bedrock authenticates through the **AWS SDK credential chain** — it does **not** use the action's `token` input. Configure AWS credentials the same way you would for any AWS SDK call: with the official [`configure-aws-credentials`](https://github.com/aws-actions/configure-aws-credentials) action, an OIDC role, an `AWS_PROFILE`, or by exporting `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` (a `AWS_BEARER_TOKEN_BEDROCK` bearer token is also supported). The configured identity must be allowed `bedrock:InvokeModelWithResponseStream` on the target model.
+
+```yaml
+- name: Configure AWS credentials
+  uses: aws-actions/configure-aws-credentials@v4
+  with:
+    role-to-assume: arn:aws:iam::123456789012:role/pi-agent
+    aws-region: us-east-1
+
+- name: Run Pi agent on Bedrock
+  uses: shaftoe/pi-coding-agent-action@v2
+  with:
+    github_token: ${{ secrets.GITHUB_TOKEN }}
+    provider: amazon-bedrock
+    model: anthropic.claude-sonnet-4-5-20250929-v1:0
+    # No `token` — Bedrock uses the AWS credentials configured above
+```
+
+> [!NOTE]
+> The Bedrock implementation (and its `@aws-sdk/client-bedrock-runtime` dependency) is **bundled into `dist/index.js`** and statically registered at startup, so it works out of the box — no runtime `node_modules` required. This adds ~500 KB to the action bundle. (Scoped to the action only; the `pi-cli` package is unaffected.)
 
 ### Disabling Built-in Extensions
 
@@ -805,7 +874,7 @@ For complex, multi-step tasks that generate a lot of context (e.g. large code re
 | `platform` | Git hosting platform the action is running on: `github` (default), `codeberg`, `forgejo`, or `gitea` (alias for `forgejo`). Determines platform-specific behaviour such as the action-run URL format in the "View action run" footer. The platform is **no longer auto-detected** from the server URL — set it explicitly when running on Forgejo/Codeberg/Gitea (e.g. `platform: forgejo`) | No | `github` |
 | `pr_number` | Pull request number to target. Use with `workflow_dispatch` to run the agent on a specific PR without a triggering event. When set, the action fetches PR context from the API and targets all operations at the specified PR | No | - |
 | `prompt` | Optional prompt to send to the agent (skips comment extraction) | No | - |
-| `provider` | LLM provider (openai, google, anthropic, etc.) | Yes | - |
+| `provider` | LLM provider (openai, google, anthropic, amazon-bedrock, etc.) | Yes | - |
 | `share_session` | Share the session like pi's `/share` command: upload the exported HTML to a gist and surface a viewer link. Uses GitHub Gists by default (`share_gist_provider: github`) or a self-hosted Opengist instance. Auto-enables `export_session_html` | No | `false` |
 | `share_gist_provider` | Storage backend for `share_session`: `github` (GitHub Gists + pi.dev viewer) or `opengist` (self-hosted instance; requires `share_gist_api_url`) | No | `github` |
 | `share_gist_api_url` | API URL for the share gist provider. Required for `opengist` (e.g. `https://gist.l3x.in/api/gists`); optional override for `github` | No | - |
@@ -814,6 +883,7 @@ For complex, multi-step tasks that generate a lot of context (e.g. large code re
 | `thinking_level` | Model thinking level | No | off |
 | `token` | Provider API token. Required for most providers, but can be omitted when using providers that support alternative auth mechanisms (e.g., `google-vertex` with Application Default Credentials) | No | - |
 | `trigger` | Trigger phrase used to invoke the action | No | /pi  |
+| `update_comment` | Whether to update/overwrite the bot's previous comment on the issue/PR instead of creating a new one. Useful for reducing noise on incremental commits (e.g. auto-review on `pull_request: [opened, synchronize]`) | No | `false` |
 
 Refer to [Pi documentation](https://pi.dev/docs/latest) for the current list of supported providers / models / etc.
 
@@ -844,7 +914,7 @@ The action extends Pi with the following built-in GitHub tools:
 
 | Tool | Description |
 |------|-------------|
-| `create_pull_request_review` | Creates a pull request review with inline comments anchored to specific lines of the diff. Posts a GitHub Pull Request Review using the `pulls.createReview` API with comments positioned on specific file paths and line numbers. Supports multi-line comments, diff side selection (LEFT/RIGHT), and review events (COMMENT, APPROVE, REQUEST_CHANGES). |
+| `create_pull_request_review` | Creates a pull request review with a summary body, inline comments anchored to specific diff lines, or both. Posts a GitHub Pull Request Review using the `pulls.createReview` API. Supports summary-only reviews, multi-line comments, diff side selection (LEFT/RIGHT), and review events (COMMENT, APPROVE, REQUEST_CHANGES). |
 | `create_pull_request` | Creates a new pull request by detecting file changes, creating a branch, committing changes via GitHub API, and opening the PR. Supports `dry_run` mode for testing without actual PR creation. |
 | `get_ci_status` | Checks the CI/CD status for a pull request or commit ref. Returns both check runs and workflow runs with their statuses, conclusions, and URLs. Accepts optional `pull_number`, `ref`, `status`, and `conclusion` filters. For failed workflow runs, use the returned `run_id` with `get_workflow_run_logs` to fetch detailed job logs. |
 | `get_issue_or_pr_thread` | Retrieves the full thread of an issue or pull request including title, body, state, labels, branch info (for PRs), all comments, and review comments (inline comments on specific lines of the diff) for PRs. Useful for understanding the full context before making changes. |
@@ -884,7 +954,7 @@ Refer to [the official Pi documentation](https://pi.dev/docs/latest) to learn ho
 
 ### Prerequisites
 
-- Bun package manager
+- pnpm package manager
 - Node.js 24+
 
 ### Validation
@@ -892,7 +962,7 @@ Refer to [the official Pi documentation](https://pi.dev/docs/latest) to learn ho
 Before committing, run the following checks:
 
 ```bash
-bun run validate
+pnpm run validate
 ```
 
 This runs:
@@ -903,20 +973,20 @@ This runs:
 
 ### Testing
 
-The project uses `bun test` for testing:
+The project uses [Vitest](https://vitest.dev/) for testing:
 
 ```bash
 # Run all tests
-bun test
+pnpm test
 
 # Run tests with coverage
-bun run test:coverage
+pnpm run test:coverage
 
 # Watch mode for development
-bun run test:watch
+pnpm run test:watch
 
 # Run end to end tests (requires LLM to be setup)
-bun run test:e2e
+pnpm run test:e2e
 ```
 
 ### Project Guidelines
@@ -924,8 +994,8 @@ bun run test:e2e
 - Follow the existing code style and conventions
 - Add tests for new functionality
 - Update documentation as needed
-- Use `bun` as the package manager (preferred over npm)
-- Run `bun run validate` before committing
+- Use `pnpm` as the package manager
+- Run `pnpm run validate` before committing
 
 ### Releasing
 

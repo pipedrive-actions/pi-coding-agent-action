@@ -5,7 +5,7 @@
  * with inline comments.
  */
 
-import { describe, expect, test, mock } from 'bun:test';
+import { describe, expect, test, vi } from 'vitest';
 import { createReview } from '@alexanderfortin/pi-platform-github';
 import type { GitHubModuleDeps } from '@alexanderfortin/pi-platform-github';
 
@@ -13,7 +13,7 @@ function createReviewDeps(overrides: { issueNumber?: number } = {}): GitHubModul
   octokit: {
     rest: {
       pulls: {
-        createReview: ReturnType<typeof mock>;
+        createReview: ReturnType<typeof vi.fn>;
       };
     };
   };
@@ -22,7 +22,7 @@ function createReviewDeps(overrides: { issueNumber?: number } = {}): GitHubModul
     octokit: {
       rest: {
         pulls: {
-          createReview: mock(() =>
+          createReview: vi.fn(() =>
             Promise.resolve({
               data: {
                 id: 999,
@@ -44,11 +44,11 @@ function createReviewDeps(overrides: { issueNumber?: number } = {}): GitHubModul
       workspace: '/tmp',
     },
     logger: {
-      debug: mock(() => {}),
-      info: mock(() => {}),
-      warning: mock(() => {}),
-      notice: mock(() => {}),
-      error: mock(() => {}),
+      debug: vi.fn(() => {}),
+      info: vi.fn(() => {}),
+      warning: vi.fn(() => {}),
+      notice: vi.fn(() => {}),
+      error: vi.fn(() => {}),
     },
   };
 }
@@ -132,6 +132,24 @@ describe('createReview', () => {
 
     const callArgs = (deps.octokit.rest.pulls.createReview as any).mock.calls[0][0];
     expect(callArgs.body).toBe('Overall looks good but a few nits');
+  });
+
+  test('creates a summary-only review without inline comments', async () => {
+    const deps = createReviewDeps();
+    const result = await createReview(deps, {
+      body: 'No issues found.',
+      event: 'COMMENT',
+      comments: [],
+    });
+
+    const callArgs = (deps.octokit.rest.pulls.createReview as any).mock.calls[0][0];
+    expect(callArgs).toMatchObject({
+      pull_number: 42,
+      body: 'No issues found.',
+      event: 'COMMENT',
+      comments: [],
+    });
+    expect(result.details.commentCount).toBe(0);
   });
 
   test('defaults body to empty string', async () => {

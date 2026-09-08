@@ -1,4 +1,4 @@
-import { describe, expect, test, mock } from 'bun:test';
+import { describe, expect, test, vi } from 'vitest';
 import {
   getIssueOrPRThreadToolFactory,
   type IssueOrPRThread,
@@ -66,15 +66,20 @@ describe('get_issue_or_pr_thread tool - execution', () => {
     expect(typeof githubIndex.getIssueOrPRThread).toBe('function');
   });
 
-  test('parameters schema - all fields are optional', () => {
+  test('parameters schema is strict-compatible (all fields required-but-nullable)', () => {
     const schema = getIssueOrPRThreadTool.parameters as any;
-    if (Array.isArray(schema.required)) {
-      expect(schema.required.length).toBe(0);
-    }
+    expect(schema.additionalProperties).toBe(false);
+    expect(getIssueOrPRThreadTool.constrainedSampling).toEqual({
+      type: 'json_schema',
+      strict: 'prefer',
+    });
+    expect(schema.required).toEqual(
+      expect.arrayContaining(['owner', 'repo', 'issue_number', 'max_comments'])
+    );
   });
 
   test('execute returns formatted thread when found', async () => {
-    const getIssueOrPRThread = mock((_params: any) => Promise.resolve(fakeThread));
+    const getIssueOrPRThread = vi.fn((_params: any) => Promise.resolve(fakeThread));
     const provider = createMockProvider({ getIssueOrPRThread });
     const tool = getIssueOrPRThreadToolFactory(provider);
 
@@ -104,7 +109,7 @@ describe('get_issue_or_pr_thread tool - execution', () => {
   });
 
   test('execute returns not-found result when provider returns undefined', async () => {
-    const getIssueOrPRThread = mock((_params: any) => Promise.resolve(undefined));
+    const getIssueOrPRThread = vi.fn((_params: any) => Promise.resolve(undefined));
     const provider = createMockProvider({ getIssueOrPRThread });
     const tool = getIssueOrPRThreadToolFactory(provider);
 
@@ -141,7 +146,7 @@ describe('get_issue_or_pr_thread tool - execution', () => {
   });
 
   test('execute passes params through to provider', async () => {
-    const getIssueOrPRThread = mock((_params: any) => Promise.resolve(undefined));
+    const getIssueOrPRThread = vi.fn((_params: any) => Promise.resolve(undefined));
     const provider = createMockProvider({ getIssueOrPRThread });
     const tool = getIssueOrPRThreadToolFactory(provider);
 
@@ -162,7 +167,7 @@ describe('get_issue_or_pr_thread tool - execution', () => {
   });
 
   test('execute returns cancellation result when signal is aborted', async () => {
-    const getIssueOrPRThread = mock((_params: any) => Promise.resolve(fakeThread));
+    const getIssueOrPRThread = vi.fn((_params: any) => Promise.resolve(fakeThread));
     const provider = createMockProvider({ getIssueOrPRThread });
     const tool = getIssueOrPRThreadToolFactory(provider);
 
@@ -192,7 +197,7 @@ describe('get_issue_or_pr_thread tool - execution', () => {
       base_branch: 'main',
       head_sha: 'abc123',
     };
-    const getIssueOrPRThread = mock((_params: any) => Promise.resolve(prThread));
+    const getIssueOrPRThread = vi.fn((_params: any) => Promise.resolve(prThread));
     const provider = createMockProvider({ getIssueOrPRThread });
     const tool = getIssueOrPRThreadToolFactory(provider);
 
